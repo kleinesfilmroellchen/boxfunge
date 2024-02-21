@@ -1,14 +1,22 @@
 #![doc = include_str!("../README.md")]
 
+use argh::FromArgValue;
 use argh::FromArgs;
 use random::Source;
 use std::fs::File;
+use std::hint::unreachable_unchecked;
 use std::io;
+use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::slice;
+use std::str::FromStr;
 use std::time::SystemTime;
+
+#[cfg(test)]
+mod test;
 
 /// "each cell of the stack can hold as much as a C language signed long int on the same platform."
 type Int = std::ffi::c_long;
@@ -19,6 +27,27 @@ const GRID_SIZE: Position = Position::new(GRID_WIDTH as i64, GRID_HEIGHT as i64)
 type Line = [u8; GRID_WIDTH];
 type Grid = [Line; GRID_HEIGHT];
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LanguageStandard {
+    Befunge93,
+    #[default]
+    Befunge98,
+}
+
+impl FromArgValue for LanguageStandard {
+    fn from_arg_value(value: &str) -> Result<Self, String> {
+        Ok(match value {
+            "93" => Self::Befunge93,
+            "98" => Self::Befunge98,
+            _ => {
+                return Err(
+                    "unknown Befunge language standard, possible values are [98, 93]".to_string(),
+                )
+            }
+        })
+    }
+}
+
 #[derive(FromArgs)]
 /// Befunge-93 interpreter.
 struct Arguments {
@@ -28,6 +57,9 @@ struct Arguments {
     /// collect and show performance metrics
     #[argh(switch, short = 'p')]
     show_performance: bool,
+    /// language standard to use, for future compatibility. default: 98
+    #[argh(option, short = 's', default = "LanguageStandard::default()")]
+    language_standard: LanguageStandard,
 }
 
 type Position = glam::I64Vec2;
@@ -38,6 +70,23 @@ enum Direction {
     Down,
     Left,
     Right,
+}
+
+impl random::Value for Direction {
+    fn read<S>(source: &mut S) -> Self
+    where
+        S: Source,
+    {
+        let random = source.read_u64();
+        match random % 4 {
+            0 => Self::Up,
+            1 => Self::Down,
+            2 => Self::Left,
+            3 => Self::Right,
+            // SAFETY: i hope math isn't broken
+            _ => unsafe { unreachable_unchecked() },
+        }
+    }
 }
 
 impl std::ops::Add<Direction> for Position {
@@ -59,7 +108,9 @@ impl std::ops::AddAssign<Direction> for Position {
     }
 }
 
-struct Interpreter {
+/// The Befunge interpreter.
+/// Lifetime parameter is for the I/O structures, which must outlive the interpreter.
+struct Interpreter<'rw> {
     // Data and program
     program_grid: Grid,
     // Core state
@@ -68,8 +119,8 @@ struct Interpreter {
     program_counter: Position,
     direction: Direction,
     // I/O
-    input: Box<dyn Read>,
-    output: Box<dyn Write>,
+    input: Box<dyn Read + 'rw>,
+    output: Box<dyn Write + 'rw>,
     rng: random::Default,
     // Debugging
     steps: usize,
@@ -98,15 +149,58 @@ impl PartialEq for Error {
     }
 }
 
-impl Interpreter {
+/// Modified from text_io's implementation to accept Read instead of iterators as an input.
+pub fn scan_next<T>(input: &mut impl Read) -> Result<T, io::Error>
+where
+    T: FromStr,
+    <T as FromStr>::Err: std::error::Error + Send + Sync + 'static,
+{
+    let mut buffer = b' ';
+    while (buffer as char).is_whitespace() {
+        let result = input.read_exact(slice::from_mut(&mut buffer));
+        match result {
+            Ok(_) => {}
+            Err(why) if why.kind() == ErrorKind::UnexpectedEof => break,
+            Err(why) => return Err(why),
+        }
+    }
+
+    let mut raw = Vec::new();
+    while !(buffer as char).is_whitespace() {
+        raw.push(buffer);
+        let result = input.read_exact(slice::from_mut(&mut buffer));
+        match result {
+            Ok(_) => {}
+            Err(why) if why.kind() == ErrorKind::UnexpectedEof => break,
+            Err(why) => return Err(why),
+        }
+    }
+
+    match String::from_utf8(raw) {
+        Ok(s) => {
+            FromStr::from_str(&s).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        }
+        Err(_) => Err(io::Error::from(io::ErrorKind::InvalidData)),
+    }
+}
+
+impl<'rw> Interpreter<'rw> {
     pub fn new(grid: &str) -> Result<Self, Error> {
+        let input = Box::new(io::stdin());
+        let output = Box::new(io::stdout());
+        Self::new_with_io(grid, input, output)
+    }
+
+    pub fn new_with_io(
+        grid: &str,
+        input: Box<dyn Read + 'rw>,
+        output: Box<dyn Write + 'rw>,
+    ) -> Result<Self, Error> {
         let start = std::time::SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs_f64();
         let parsed_grid = Self::parse_grid(grid)?;
-        let input = Box::new(io::stdin());
-        let output = Box::new(io::stdout());
         Ok(Self {
             stack: Vec::new(),
             program_grid: parsed_grid,
@@ -144,11 +238,11 @@ impl Interpreter {
             let mut grid = lines
                 .into_iter()
                 .map(|mut line| {
-                    line.resize(GRID_WIDTH, 0);
+                    line.resize(GRID_WIDTH, b' ');
                     Line::try_from(line).unwrap()
                 })
                 .collect::<Vec<_>>();
-            grid.resize(GRID_HEIGHT, [0; GRID_WIDTH]);
+            grid.resize(GRID_HEIGHT, [b' '; GRID_WIDTH]);
             grid
         })
         .unwrap())
@@ -210,11 +304,6 @@ impl Interpreter {
                 }
                 b'?' => {
                     self.direction = self.rng.read();
-                    self.direction = if top == 0 {
-                        Direction::Right
-                    } else {
-                        Direction::Left
-                    };
                     move_pc!();
                     Ok(())
                 }
@@ -223,9 +312,19 @@ impl Interpreter {
                     move_pc!();
                     Ok(())
                 }
-                // Stringmode
+                b' ' => {
+                    move_pc!();
+                    Ok(())
+                }
+                // Literals
                 b'"' => {
                     self.string_mode = true;
+                    move_pc!();
+                    Ok(())
+                }
+                b'0'..=b'9' => {
+                    let number = current_char - b'0';
+                    self.stack.push(number as Int);
                     move_pc!();
                     Ok(())
                 }
@@ -251,6 +350,55 @@ impl Interpreter {
                     move_pc!();
                     Ok(())
                 }
+                // Math ops
+                b'+' => {
+                    let b = self.stack.pop().unwrap_or_default();
+                    let a = self.stack.pop().unwrap_or_default();
+                    self.stack.push(a.wrapping_add(b));
+                    move_pc!();
+                    Ok(())
+                }
+                b'-' => {
+                    let b = self.stack.pop().unwrap_or_default();
+                    let a = self.stack.pop().unwrap_or_default();
+                    self.stack.push(a.wrapping_sub(b));
+                    move_pc!();
+                    Ok(())
+                }
+                b'*' => {
+                    let b = self.stack.pop().unwrap_or_default();
+                    let a = self.stack.pop().unwrap_or_default();
+                    self.stack.push(a.wrapping_mul(b));
+                    move_pc!();
+                    Ok(())
+                }
+                b'/' => {
+                    let b = self.stack.pop().unwrap_or_default();
+                    let a = self.stack.pop().unwrap_or_default();
+                    self.stack.push(a.wrapping_div(b));
+                    move_pc!();
+                    Ok(())
+                }
+                b'%' => {
+                    let b = self.stack.pop().unwrap_or_default();
+                    let a = self.stack.pop().unwrap_or_default();
+                    self.stack.push(a.wrapping_rem(b));
+                    move_pc!();
+                    Ok(())
+                }
+                b'!' => {
+                    let b = self.stack.pop().unwrap_or_default();
+                    self.stack.push(if b == 0 { 1 } else { 0 });
+                    move_pc!();
+                    Ok(())
+                }
+                b'`' => {
+                    let b = self.stack.pop().unwrap_or_default();
+                    let a = self.stack.pop().unwrap_or_default();
+                    self.stack.push(if a > b { 1 } else { 0 });
+                    move_pc!();
+                    Ok(())
+                }
                 // I/O
                 b',' => {
                     let top = self.stack.pop().unwrap_or_default();
@@ -258,12 +406,32 @@ impl Interpreter {
                         char::try_from(u32::try_from(top).map_err(|_| Error::NonAscii(top))?)
                             .map_err(|_| Error::NonAscii(top))?;
                     if !ascii.is_ascii() {
-                        Err(Error::NonAscii(ascii as i64))
+                        Err(Error::NonAscii(ascii as Int))
                     } else {
-                        self.output.write(&[ascii as u8])?;
+                        self.output.write_all(&[ascii as u8])?;
                         move_pc!();
                         Ok(())
                     }
+                }
+                b'.' => {
+                    let top = self.stack.pop().unwrap_or_default();
+                    let text = top.to_string();
+                    self.output.write(text.as_bytes())?;
+                    move_pc!();
+                    Ok(())
+                }
+                b'~' => {
+                    let mut ascii = Vec::from([0]);
+                    self.input.read_exact(&mut ascii)?;
+                    self.stack.push(ascii[0].into());
+                    move_pc!();
+                    Ok(())
+                }
+                b'&' => {
+                    let number = scan_next(&mut self.input)?;
+                    self.stack.push(number);
+                    move_pc!();
+                    Ok(())
                 }
                 // Conditionals
                 b'_' => {
@@ -288,11 +456,11 @@ impl Interpreter {
                 }
                 // Misc
                 b'@' => Err(Error::ProgramEnd),
-                b' ' => {
-                    move_pc!();
-                    Ok(())
-                }
-                _ => todo!(),
+                _ => todo!(
+                    "unimplemented command '{}' ({:02x})",
+                    current_char as char,
+                    current_char
+                ),
             }
         }
     }
@@ -300,6 +468,12 @@ impl Interpreter {
 
 fn main() -> Result<(), Error> {
     let args: Arguments = argh::from_env();
+
+    if args.language_standard != LanguageStandard::Befunge93 {
+        eprintln!("only Befunge-93 is currently supported");
+        std::process::exit(1);
+    }
+
     let mut grid: String = String::new();
     if args.input == Path::new("-") {
         io::stdin().read_to_string(&mut grid)?;
