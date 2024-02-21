@@ -6,4 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+argh = "0.1.12"
+glam = "0.25.0"
+random = "0.14.0"
 thiserror = "1.0.57"
