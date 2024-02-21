@@ -538,8 +538,8 @@ fn run_interpreter(args: Arguments) -> Result<(), Error> {
         let time_per_step = time / interpreter.steps as u32;
         println!();
         println!(
-            "execution took {:?}, {} steps, {:?} / step",
-            time, interpreter.steps, time_per_step
+            "execution took {:?}, {} steps, {:?} / step, {:.3} Msteps/s",
+            time, interpreter.steps, time_per_step, 1_000.0 / time_per_step.as_nanos() as f64
         );
     }
 

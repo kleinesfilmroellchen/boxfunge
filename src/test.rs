@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use crate::run_interpreter;
+use crate::Arguments;
 use crate::Error;
 use crate::Interpreter;
 
@@ -42,6 +44,13 @@ fn digiroot() {
 }
 
 #[test]
+fn randomness() {
+    run_file_with_input("programs/rng.bf", b"0 19").unwrap();
+    run_file("programs/dna1.bf").unwrap();
+    run_file("programs/dna2.bf").unwrap();
+}
+
+#[test]
 fn quines() {
     for quine_file in [
         "programs/kquine1.bf",
@@ -56,4 +65,48 @@ fn quines() {
             std::fs::read_to_string(quine_file).unwrap().trim_end()
         );
     }
+}
+
+#[test]
+fn self_interpreter() {
+    const SELF_INTERPRETER: &str = "programs/self_interpreter.bf";
+
+    macro_rules! check_interpreters_equal {
+        ($file:expr) => {
+            assert_eq!(
+                run_file_with_input(
+                    SELF_INTERPRETER,
+                    &std::fs::read_to_string($file).unwrap().into_bytes()
+                )
+                .unwrap(),
+                run_file($file).unwrap()
+            );
+        };
+    }
+
+    // only check programs with deterministic output and without user input
+    check_interpreters_equal!("programs/terminate.bf");
+    check_interpreters_equal!("programs/hello_world.bf");
+    check_interpreters_equal!("programs/kquine1.bf");
+    check_interpreters_equal!("programs/kquine2.bf");
+    check_interpreters_equal!("programs/primesieve.bf");
+}
+
+#[test]
+fn cli() {
+    run_interpreter(Arguments {
+        input: "programs/hello_world.bf".into(),
+        show_performance: false,
+        language_standard: crate::LanguageStandard::Befunge93,
+        stdin: None,
+    })
+    .unwrap();
+
+    run_interpreter(Arguments {
+        input: "programs/self_interpreter.bf".into(),
+        show_performance: true,
+        language_standard: crate::LanguageStandard::Befunge93,
+        stdin: Some("programs/kquine3.bf".into()),
+    })
+    .unwrap();
 }
