@@ -267,9 +267,14 @@ impl<'rw> Interpreter<'rw> {
         macro_rules! move_pc {
             () => {
                 self.program_counter += self.direction;
-                // FIXME: Hack to work around -1 % 80 != 79
-                self.program_counter += GRID_SIZE;
-                self.program_counter %= GRID_SIZE;
+                if !(0..GRID_WIDTH).contains(&(self.program_counter.x as usize)) {
+                    self.program_counter.x =
+                        (self.program_counter.x + GRID_WIDTH as i64) % GRID_WIDTH as i64;
+                }
+                if !(0..GRID_HEIGHT).contains(&(self.program_counter.y as usize)) {
+                    self.program_counter.y =
+                        (self.program_counter.y + GRID_HEIGHT as i64) % GRID_HEIGHT as i64;
+                }
             };
         }
         self.steps += 1;
