@@ -539,7 +539,10 @@ fn run_interpreter(args: Arguments) -> Result<(), Error> {
         println!();
         println!(
             "execution took {:?}, {} steps, {:?} / step, {:.3} Msteps/s",
-            time, interpreter.steps, time_per_step, 1_000.0 / time_per_step.as_nanos() as f64
+            time,
+            interpreter.steps,
+            time_per_step,
+            1_000.0 / time_per_step.as_nanos() as f64
         );
     }
 
