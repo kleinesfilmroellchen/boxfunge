@@ -415,8 +415,7 @@ impl<'rw> Interpreter<'rw> {
                 }
                 b'.' => {
                     let top = self.stack.pop().unwrap_or_default();
-                    let text = top.to_string();
-                    self.output.write(text.as_bytes())?;
+                    write!(self.output, "{} ", top)?;
                     move_pc!();
                     Ok(())
                 }
@@ -451,6 +450,24 @@ impl<'rw> Interpreter<'rw> {
                     } else {
                         Direction::Up
                     };
+                    move_pc!();
+                    Ok(())
+                }
+                // Self-modification
+                b'g' => {
+                    let y = self.stack.pop().unwrap_or_default();
+                    let x = self.stack.pop().unwrap_or_default();
+                    self.stack.push(
+                        self.program_grid[y as usize % GRID_HEIGHT][x as usize % GRID_WIDTH] as Int,
+                    );
+                    move_pc!();
+                    Ok(())
+                }
+                b'p' => {
+                    let y = self.stack.pop().unwrap_or_default();
+                    let x = self.stack.pop().unwrap_or_default();
+                    let value = self.stack.pop().unwrap_or_default();
+                    self.program_grid[y as usize][x as usize] = value as u8;
                     move_pc!();
                     Ok(())
                 }
