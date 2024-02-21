@@ -235,7 +235,7 @@ impl<'rw> Interpreter<'rw> {
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let height = lines.len();
-        let width = lines.get(0).map_or(0, |v| v.len());
+        let width = lines.first().map_or(0, |v| v.len());
         if height > GRID_HEIGHT || width > GRID_WIDTH {
             return Err(Error::InvalidGridSize(width, height));
         }
