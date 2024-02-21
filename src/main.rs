@@ -60,6 +60,9 @@ struct Arguments {
     /// language standard to use, for future compatibility. default: 98
     #[argh(option, short = 's', default = "LanguageStandard::default()")]
     language_standard: LanguageStandard,
+    /// file to use as stdin for the program; particularly useful with self-interpreters
+    #[argh(option, short = 'i')]
+    stdin: Option<PathBuf>,
 }
 
 type Position = glam::I64Vec2;
@@ -134,6 +137,8 @@ enum Error {
     InvalidGridSize(usize, usize),
     #[error("Non-ASCII character \"{0:x}\" in input")]
     NonAscii(Int),
+    #[error("Illegal command '{}' ({0:x})", *.0 as char)]
+    IllegalCommand(u8),
     #[error("Program terminated normally")]
     ProgramEnd,
 }
@@ -156,22 +161,22 @@ where
     <T as FromStr>::Err: std::error::Error + Send + Sync + 'static,
 {
     let mut buffer = b' ';
-    while (buffer as char).is_whitespace() {
+    while (buffer as char).is_whitespace() || buffer == 0 {
         let result = input.read_exact(slice::from_mut(&mut buffer));
         match result {
             Ok(_) => {}
-            Err(why) if why.kind() == ErrorKind::UnexpectedEof => break,
+            Err(why) if why.kind() == ErrorKind::UnexpectedEof => buffer = 0,
             Err(why) => return Err(why),
         }
     }
 
     let mut raw = Vec::new();
-    while !(buffer as char).is_whitespace() {
+    while !(buffer as char).is_whitespace() && buffer != 0 {
         raw.push(buffer);
         let result = input.read_exact(slice::from_mut(&mut buffer));
         match result {
             Ok(_) => {}
-            Err(why) if why.kind() == ErrorKind::UnexpectedEof => break,
+            Err(why) if why.kind() == ErrorKind::UnexpectedEof => buffer = 0,
             Err(why) => return Err(why),
         }
     }
@@ -330,8 +335,9 @@ impl<'rw> Interpreter<'rw> {
                 }
                 // Stack ops
                 b':' => {
-                    self.stack
-                        .push(self.stack.last().cloned().unwrap_or_default());
+                    let top = self.stack.pop().unwrap_or_default();
+                    self.stack.push(top);
+                    self.stack.push(top);
                     move_pc!();
                     Ok(())
                 }
@@ -420,9 +426,24 @@ impl<'rw> Interpreter<'rw> {
                     Ok(())
                 }
                 b'~' => {
-                    let mut ascii = Vec::from([0]);
-                    self.input.read_exact(&mut ascii)?;
-                    self.stack.push(ascii[0].into());
+                    // To my knowledge, the EOF behavior of Befunge-93 input is documented nowhere.
+                    // jsFunge (and probably all others) will retrieve -1 on EOF, and not a null character.
+                    // Conveniently, 0xff is not a valid byte for UTF-8 coding, so we can use it here.
+                    let mut ascii = 0xff;
+                    self.input
+                        .read_exact(slice::from_mut(&mut ascii))
+                        .map_or_else(
+                            |e| {
+                                if e.kind() == ErrorKind::UnexpectedEof {
+                                    Ok(())
+                                } else {
+                                    Err(e)
+                                }
+                            },
+                            |_| Ok(()),
+                        )?;
+                    self.stack
+                        .push(if ascii != 0xff { ascii.into() } else { -1 });
                     move_pc!();
                     Ok(())
                 }
@@ -458,7 +479,14 @@ impl<'rw> Interpreter<'rw> {
                     let y = self.stack.pop().unwrap_or_default();
                     let x = self.stack.pop().unwrap_or_default();
                     self.stack.push(
-                        self.program_grid[y as usize % GRID_HEIGHT][x as usize % GRID_WIDTH] as Int,
+                        if !(0..GRID_WIDTH as Int).contains(&x)
+                            || !(0..GRID_HEIGHT as Int).contains(&y)
+                        {
+                            0
+                        } else {
+                            // make sure to retain signedness, even though ASCII is not really signed
+                            self.program_grid[y as usize][x as usize] as i8 as Int
+                        },
                     );
                     move_pc!();
                     Ok(())
@@ -467,41 +495,43 @@ impl<'rw> Interpreter<'rw> {
                     let y = self.stack.pop().unwrap_or_default();
                     let x = self.stack.pop().unwrap_or_default();
                     let value = self.stack.pop().unwrap_or_default();
-                    self.program_grid[y as usize][x as usize] = value as u8;
+                    if (0..GRID_WIDTH as Int).contains(&x) && (0..GRID_HEIGHT as Int).contains(&y) {
+                        self.program_grid[y as usize % GRID_HEIGHT][x as usize % GRID_WIDTH] =
+                            value as u8;
+                    }
                     move_pc!();
                     Ok(())
                 }
                 // Misc
                 b'@' => Err(Error::ProgramEnd),
-                _ => todo!(
-                    "unimplemented command '{}' ({:02x})",
-                    current_char as char,
-                    current_char
-                ),
+                _ => Err(Error::IllegalCommand(current_char)),
             }
         }
     }
 }
 
-fn main() -> Result<(), Error> {
-    let args: Arguments = argh::from_env();
-
-    if args.language_standard != LanguageStandard::Befunge93 {
-        eprintln!("only Befunge-93 is currently supported");
-        std::process::exit(1);
-    }
-
+fn run_interpreter(args: Arguments) -> Result<(), Error> {
     let mut grid: String = String::new();
     if args.input == Path::new("-") {
         io::stdin().read_to_string(&mut grid)?;
     } else {
         File::open(args.input)?.read_to_string(&mut grid)?;
     }
-    let mut interpreter = Box::new(Interpreter::new(&grid)?);
+    let mut interpreter = Box::new(args.stdin.map_or_else(
+        || Interpreter::new(&grid),
+        |stdin| {
+            Interpreter::new_with_io(&grid, Box::new(File::open(stdin)?), Box::new(io::stdout()))
+        },
+    )?);
 
     let start = std::time::Instant::now();
-    interpreter.run_forever()?;
+    let result = interpreter.run_forever();
     let end = std::time::Instant::now();
+
+    match result {
+        Ok(_) => {}
+        Err(ref why) => eprintln!("error at {}: {}", interpreter.program_counter, why),
+    }
 
     if args.show_performance {
         let time = end - start;
@@ -513,5 +543,20 @@ fn main() -> Result<(), Error> {
         );
     }
 
+    if result.is_err() {
+        std::process::exit(1);
+    }
+
     Ok(())
+}
+
+fn main() {
+    let args: Arguments = argh::from_env();
+
+    if args.language_standard != LanguageStandard::Befunge93 {
+        eprintln!("only Befunge-93 is currently supported");
+        std::process::exit(1);
+    }
+
+    run_interpreter(args).unwrap();
 }
