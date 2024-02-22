@@ -2,6 +2,7 @@
 
 use argh::FromArgValue;
 use argh::FromArgs;
+use jit::JustInTimeCompiler;
 use random::Source;
 use std::fs::File;
 use std::hint::unreachable_unchecked;
@@ -13,7 +14,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::slice;
 use std::str::FromStr;
-use std::time::SystemTime;
 
 mod jit;
 
@@ -58,6 +58,9 @@ struct Arguments {
     /// collect and show performance metrics
     #[argh(switch, short = 'p')]
     show_performance: bool,
+    /// use the experimental just-in-time compiler
+    #[argh(switch, short = 'j')]
+    use_jit: bool,
     /// language standard to use, for future compatibility. default: 98
     #[argh(option, short = 's', default = "LanguageStandard::default()")]
     language_standard: LanguageStandard,
@@ -68,7 +71,7 @@ struct Arguments {
 
 type Position = glam::I64Vec2;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum Direction {
     Up,
     Down,
@@ -77,7 +80,7 @@ enum Direction {
     Right,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 struct PC {
     position: Position,
     direction: Direction,
@@ -132,6 +135,14 @@ impl std::ops::AddAssign<Direction> for Position {
     fn add_assign(&mut self, rhs: Direction) {
         *self = *self + rhs;
     }
+}
+
+/// Anything executing a Befunge program.
+trait Executer {
+    /// Run the executer's main loop.
+    fn run_forever(&mut self) -> Result<(), Error>;
+    fn steps(&self) -> usize;
+    fn position(&self) -> Position;
 }
 
 /// The Befunge interpreter.
@@ -224,7 +235,7 @@ impl<'rw> Interpreter<'rw> {
         output: Box<dyn Write + 'rw>,
     ) -> Result<Self, Error> {
         let start = std::time::SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs_f64();
         let parsed_grid = Self::parse_grid(grid)?;
@@ -240,7 +251,7 @@ impl<'rw> Interpreter<'rw> {
         })
     }
 
-    fn parse_grid(grid: &str) -> Result<Grid, Error> {
+    pub fn parse_grid(grid: &str) -> Result<Grid, Error> {
         let lines = grid
             .lines()
             .map(|line| {
@@ -272,16 +283,6 @@ impl<'rw> Interpreter<'rw> {
             grid
         })
         .unwrap())
-    }
-
-    pub fn run_forever(&mut self) -> Result<(), Error> {
-        loop {
-            let result = self.run_step();
-            if result.as_ref().is_err_and(|e| e == &Error::ProgramEnd) {
-                return Ok(());
-            }
-            result?;
-        }
     }
 
     pub fn run_step(&mut self) -> Result<(), Error> {
@@ -529,6 +530,26 @@ impl<'rw> Interpreter<'rw> {
     }
 }
 
+impl<'rw> Executer for Interpreter<'rw> {
+    fn run_forever(&mut self) -> Result<(), Error> {
+        loop {
+            let result = self.run_step();
+            if result.as_ref().is_err_and(|e| e == &Error::ProgramEnd) {
+                return Ok(());
+            }
+            result?;
+        }
+    }
+
+    fn steps(&self) -> usize {
+        self.steps
+    }
+
+    fn position(&self) -> Position {
+        self.program_counter.position
+    }
+}
+
 fn run_interpreter(args: Arguments) -> Result<(), Error> {
     let mut grid: String = String::new();
     if args.input == Path::new("-") {
@@ -536,12 +557,29 @@ fn run_interpreter(args: Arguments) -> Result<(), Error> {
     } else {
         File::open(args.input)?.read_to_string(&mut grid)?;
     }
-    let mut interpreter = Box::new(args.stdin.map_or_else(
-        || Interpreter::new(&grid),
-        |stdin| {
-            Interpreter::new_with_io(&grid, Box::new(File::open(stdin)?), Box::new(io::stdout()))
-        },
-    )?);
+    let mut interpreter: Box<dyn Executer> = if args.use_jit {
+        Box::new(args.stdin.map_or_else(
+            || JustInTimeCompiler::new(&grid),
+            |stdin| {
+                JustInTimeCompiler::new_with_io(
+                    &grid,
+                    Box::new(File::open(stdin)?),
+                    Box::new(io::stdout()),
+                )
+            },
+        )?)
+    } else {
+        Box::new(args.stdin.map_or_else(
+            || Interpreter::new(&grid),
+            |stdin| {
+                Interpreter::new_with_io(
+                    &grid,
+                    Box::new(File::open(stdin)?),
+                    Box::new(io::stdout()),
+                )
+            },
+        )?)
+    };
 
     let start = std::time::Instant::now();
     let result = interpreter.run_forever();
@@ -549,17 +587,17 @@ fn run_interpreter(args: Arguments) -> Result<(), Error> {
 
     match result {
         Ok(_) => {}
-        Err(ref why) => eprintln!("error at {}: {}", interpreter.program_counter.position, why),
+        Err(ref why) => eprintln!("error at {}: {}", interpreter.position(), why),
     }
 
     if args.show_performance {
         let time = end - start;
-        let time_per_step = time / interpreter.steps as u32;
+        let time_per_step = time / interpreter.steps() as u32;
         println!();
         println!(
             "execution took {:?}, {} steps, {:?} / step, {:.3} Msteps/s",
             time,
-            interpreter.steps,
+            interpreter.steps(),
             time_per_step,
             1_000.0 / time_per_step.as_nanos() as f64
         );

@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::run_interpreter;
 use crate::Arguments;
 use crate::Error;
+use crate::Executer;
 use crate::Interpreter;
 
 fn run_file(path: impl AsRef<Path>) -> Result<String, Error> {
@@ -99,6 +100,7 @@ fn cli() {
         show_performance: false,
         language_standard: crate::LanguageStandard::Befunge93,
         stdin: None,
+        use_jit: false,
     })
     .unwrap();
 
@@ -107,6 +109,7 @@ fn cli() {
         show_performance: true,
         language_standard: crate::LanguageStandard::Befunge93,
         stdin: Some("programs/kquine3.bf".into()),
+        use_jit: false,
     })
     .unwrap();
 }
