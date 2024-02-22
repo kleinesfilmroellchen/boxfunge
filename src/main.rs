@@ -15,6 +15,8 @@ use std::slice;
 use std::str::FromStr;
 use std::time::SystemTime;
 
+mod jit;
+
 #[cfg(test)]
 mod test;
 
@@ -23,7 +25,6 @@ type Int = std::ffi::c_long;
 
 const GRID_HEIGHT: usize = 25;
 const GRID_WIDTH: usize = 80;
-const GRID_SIZE: Position = Position::new(GRID_WIDTH as i64, GRID_HEIGHT as i64);
 type Line = [u8; GRID_WIDTH];
 type Grid = [Line; GRID_HEIGHT];
 
@@ -67,12 +68,34 @@ struct Arguments {
 
 type Position = glam::I64Vec2;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Direction {
     Up,
     Down,
     Left,
+    #[default]
     Right,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PC {
+    position: Position,
+    direction: Direction,
+}
+
+impl PC {
+    pub fn step(&mut self) {
+        self.position += self.direction;
+    }
+
+    pub fn constrain(&mut self) {
+        if !(0..GRID_WIDTH).contains(&(self.position.x as usize)) {
+            self.position.x = (self.position.x + GRID_WIDTH as i64) % GRID_WIDTH as i64;
+        }
+        if !(0..GRID_HEIGHT).contains(&(self.position.y as usize)) {
+            self.position.y = (self.position.y + GRID_HEIGHT as i64) % GRID_HEIGHT as i64;
+        }
+    }
 }
 
 impl random::Value for Direction {
@@ -119,8 +142,7 @@ struct Interpreter<'rw> {
     // Core state
     stack: Vec<Int>,
     string_mode: bool,
-    program_counter: Position,
-    direction: Direction,
+    program_counter: PC,
     // I/O
     input: Box<dyn Read + 'rw>,
     output: Box<dyn Write + 'rw>,
@@ -210,10 +232,9 @@ impl<'rw> Interpreter<'rw> {
             stack: Vec::new(),
             program_grid: parsed_grid,
             string_mode: false,
-            program_counter: Position::ZERO,
+            program_counter: PC::default(),
             input,
             output,
-            direction: Direction::Right,
             rng: random::Default::new([start.to_bits(), start.to_bits()]),
             steps: 0,
         })
@@ -266,21 +287,14 @@ impl<'rw> Interpreter<'rw> {
     pub fn run_step(&mut self) -> Result<(), Error> {
         macro_rules! move_pc {
             () => {
-                self.program_counter += self.direction;
-                if !(0..GRID_WIDTH).contains(&(self.program_counter.x as usize)) {
-                    self.program_counter.x =
-                        (self.program_counter.x + GRID_WIDTH as i64) % GRID_WIDTH as i64;
-                }
-                if !(0..GRID_HEIGHT).contains(&(self.program_counter.y as usize)) {
-                    self.program_counter.y =
-                        (self.program_counter.y + GRID_HEIGHT as i64) % GRID_HEIGHT as i64;
-                }
+                self.program_counter.step();
+                self.program_counter.constrain();
             };
         }
         self.steps += 1;
 
-        let current_char =
-            self.program_grid[self.program_counter.y as usize][self.program_counter.x as usize];
+        let current_char = self.program_grid[self.program_counter.position.y as usize]
+            [self.program_counter.position.x as usize];
         if self.string_mode {
             if current_char == b'"' {
                 self.string_mode = false;
@@ -293,27 +307,27 @@ impl<'rw> Interpreter<'rw> {
             match current_char {
                 // PC redirection
                 b'>' => {
-                    self.direction = Direction::Right;
+                    self.program_counter.direction = Direction::Right;
                     move_pc!();
                     Ok(())
                 }
                 b'<' => {
-                    self.direction = Direction::Left;
+                    self.program_counter.direction = Direction::Left;
                     move_pc!();
                     Ok(())
                 }
                 b'^' => {
-                    self.direction = Direction::Up;
+                    self.program_counter.direction = Direction::Up;
                     move_pc!();
                     Ok(())
                 }
                 b'v' => {
-                    self.direction = Direction::Down;
+                    self.program_counter.direction = Direction::Down;
                     move_pc!();
                     Ok(())
                 }
                 b'?' => {
-                    self.direction = self.rng.read();
+                    self.program_counter.direction = self.rng.read();
                     move_pc!();
                     Ok(())
                 }
@@ -461,7 +475,7 @@ impl<'rw> Interpreter<'rw> {
                 // Conditionals
                 b'_' => {
                     let top = self.stack.pop().unwrap_or_default();
-                    self.direction = if top == 0 {
+                    self.program_counter.direction = if top == 0 {
                         Direction::Right
                     } else {
                         Direction::Left
@@ -471,7 +485,7 @@ impl<'rw> Interpreter<'rw> {
                 }
                 b'|' => {
                     let top = self.stack.pop().unwrap_or_default();
-                    self.direction = if top == 0 {
+                    self.program_counter.direction = if top == 0 {
                         Direction::Down
                     } else {
                         Direction::Up
@@ -535,7 +549,7 @@ fn run_interpreter(args: Arguments) -> Result<(), Error> {
 
     match result {
         Ok(_) => {}
-        Err(ref why) => eprintln!("error at {}: {}", interpreter.program_counter, why),
+        Err(ref why) => eprintln!("error at {}: {}", interpreter.program_counter.position, why),
     }
 
     if args.show_performance {
