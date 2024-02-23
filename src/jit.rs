@@ -243,12 +243,14 @@ impl BasicBlock {
 }
 
 /// A map from grid cells to all entry points of basic blocks that pass through the cell.
-type GridBlockMap = [[SmallVec<[PC; 4]>; GRID_WIDTH]; GRID_HEIGHT];
+/// FIXME: This type is very fast but large. The given size just about doesn't violate Windows 10's stack size limit.
+// Figure out a way of allocating it on the heap directly.
+type GridBlockMap = [[SmallVec<[PC; 9]>; GRID_WIDTH]; GRID_HEIGHT];
 
 pub struct JustInTimeCompiler<'rw> {
     basic_blocks: HashMap<PC, Rc<BasicBlock>, FastHasher>,
     program_grid: Grid,
-    grid_block_map: GridBlockMap,
+    grid_block_map: Box<GridBlockMap>,
     stack: Vec<Int>,
     program_counter: PC,
     // I/O
@@ -280,7 +282,7 @@ impl<'rw> JustInTimeCompiler<'rw> {
             basic_blocks: Default::default(),
             stack: Vec::new(),
             program_grid: parsed_grid,
-            grid_block_map: array::from_fn(|_| array::from_fn(|_| SmallVec::new())),
+            grid_block_map: Box::new(array::from_fn(|_| array::from_fn(|_| SmallVec::new()))),
             program_counter: PC::default(),
             input,
             output,
