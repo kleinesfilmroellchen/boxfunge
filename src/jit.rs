@@ -19,17 +19,26 @@
 //! When a self-modification occurs, all basic blocks on the path of the self-modification are discarded. Execution continues from the next cell as given in the SetValue byte code op if the basic block invalidated itself. The latter is less efficient than it could be, since we could continue executing the basic block if the modification happened only for byte code ops that have already been executed. However, this would require keeping track of source cells for each byte code op, which seems like a significant complication in terms of memory management (one byte code op may refer to many source cells after optimization). It is not clear if this actually provides a practical benefit, since a lot of code is not immediately self-modifying, rather modifying some other (often distant) basic block.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::rc::Rc;
 
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
+
+use crate::scan_next;
+use crate::Direction;
 use crate::Error;
 use crate::Executer;
+use crate::FastHasher;
 use crate::Grid;
 use crate::Int;
 use crate::Interpreter;
 use crate::Position;
+use crate::GRID_HEIGHT;
+use crate::GRID_WIDTH;
 use crate::PC;
 
 /// JIT byte code operations.
@@ -108,12 +117,11 @@ enum ControlFlowDecision {
     Random { choices: [PC; 4] },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct BasicBlock {
     entry_point: PC,
-    cells: Vec<Position>,
+    cells: HashSet<Position, FastHasher>,
     bytecode: Vec<Operation>,
-    next_bytecode_op: usize,
     cf_decision: ControlFlowDecision,
 }
 
@@ -124,20 +132,126 @@ impl std::hash::Hash for BasicBlock {
 }
 
 impl BasicBlock {
+    fn new(entry_point: PC) -> Self {
+        Self {
+            entry_point,
+            cells: Default::default(),
+            bytecode: Vec::new(),
+            cf_decision: ControlFlowDecision::EndProgram,
+        }
+    }
+
     fn execute(&self, jit: &mut JustInTimeCompiler<'_>) -> Result<ControlFlowDecision, Error> {
-        todo!()
+        for op in &self.bytecode {
+            match op {
+                Operation::PushConstant(number) => jit.stack.push(*number),
+                Operation::Duplicate => {
+                    let top = jit.stack.pop().unwrap_or_default();
+                    jit.stack.push(top);
+                    jit.stack.push(top);
+                }
+                Operation::Swap => {
+                    let first = jit.stack.pop().unwrap_or_default();
+                    let second = jit.stack.pop().unwrap_or_default();
+                    jit.stack.push(first);
+                    jit.stack.push(second);
+                }
+                Operation::Drop => {
+                    jit.stack.pop();
+                }
+                Operation::Binary(binary) => {
+                    let b = jit.stack.pop().unwrap_or_default();
+                    let a = jit.stack.pop().unwrap_or_default();
+                    jit.stack.push(binary.call(a, b));
+                }
+                Operation::Negate => {
+                    let top = jit.stack.pop().unwrap_or_default();
+                    jit.stack.push(if top == 0 { 1 } else { 0 });
+                }
+                Operation::Input(IOMode::Ascii) => {
+                    // To my knowledge, the EOF behavior of Befunge-93 input is documented nowhere.
+                    // jsFunge (and probably all others) will retrieve -1 on EOF, and not a null character.
+                    // Conveniently, 0xff is not a valid byte for UTF-8 coding, so we can use it here.
+                    let mut ascii = 0xff;
+                    jit.input
+                        .read_exact(std::slice::from_mut(&mut ascii))
+                        .map_or_else(
+                            |e| {
+                                if e.kind() == io::ErrorKind::UnexpectedEof {
+                                    Ok(())
+                                } else {
+                                    Err(e)
+                                }
+                            },
+                            |_| Ok(()),
+                        )?;
+                    jit.stack
+                        .push(if ascii != 0xff { ascii.into() } else { -1 });
+                }
+                Operation::Input(IOMode::Decimal) => {
+                    let number = scan_next(&mut jit.input)?;
+                    jit.stack.push(number);
+                }
+                Operation::Output(IOMode::Ascii) => {
+                    let top = jit.stack.pop().unwrap_or_default();
+                    let ascii =
+                        char::try_from(u32::try_from(top).map_err(|_| Error::NonAscii(top))?)
+                            .map_err(|_| Error::NonAscii(top))?;
+                    if !ascii.is_ascii() {
+                        return Err(Error::NonAscii(ascii as Int));
+                    } else {
+                        jit.output.write_all(&[ascii as u8])?;
+                    }
+                }
+                Operation::Output(IOMode::Decimal) => {
+                    let top = jit.stack.pop().unwrap_or_default();
+                    write!(jit.output, "{} ", top)?;
+                }
+                Operation::GetValue => {
+                    let y = jit.stack.pop().unwrap_or_default();
+                    let x = jit.stack.pop().unwrap_or_default();
+                    jit.stack.push(
+                        if !(0..GRID_WIDTH as Int).contains(&x)
+                            || !(0..GRID_HEIGHT as Int).contains(&y)
+                        {
+                            0
+                        } else {
+                            // make sure to retain signedness, even though ASCII is not really signed
+                            jit.program_grid[y as usize][x as usize] as i8 as Int
+                        },
+                    );
+                }
+                Operation::SetValue { pc_after } => {
+                    let y = jit.stack.pop().unwrap_or_default();
+                    let x = jit.stack.pop().unwrap_or_default();
+                    let position = Position::new(x as _, y as _);
+                    let value = jit.stack.pop().unwrap_or_default();
+                    if (0..GRID_WIDTH as Int).contains(&x) && (0..GRID_HEIGHT as Int).contains(&y) {
+                        jit.program_grid[y as usize][x as usize] = value as u8;
+                    }
+                    jit.invalidate_bytecode(position);
+                    // If we were invalidated, exit bytecode immediately and continue with the next PC.
+                    if self.cells.contains(&position) {
+                        return Ok(ControlFlowDecision::Jump(*pc_after));
+                    }
+                }
+            }
+        }
+        Ok(self.cf_decision)
     }
 }
 
 pub struct JustInTimeCompiler<'rw> {
-    basic_blocks: HashMap<PC, Rc<BasicBlock>>,
+    basic_blocks: HashMap<PC, Rc<BasicBlock>, FastHasher>,
     program_grid: Grid,
     stack: Vec<Int>,
     program_counter: PC,
     // I/O
     input: Box<dyn Read + 'rw>,
     output: Box<dyn Write + 'rw>,
-    rng: random::Default,
+    rng: rand::rngs::SmallRng,
+    // Statistics
+    basic_block_compiles: usize,
 }
 
 impl<'rw> JustInTimeCompiler<'rw> {
@@ -158,18 +272,271 @@ impl<'rw> JustInTimeCompiler<'rw> {
             .as_secs_f64();
         let parsed_grid = Interpreter::parse_grid(grid)?;
         Ok(Self {
-            basic_blocks: HashMap::new(),
+            basic_blocks: Default::default(),
             stack: Vec::new(),
             program_grid: parsed_grid,
             program_counter: PC::default(),
             input,
             output,
-            rng: random::Default::new([start.to_bits(), start.to_bits()]),
+            rng: rand::rngs::SmallRng::seed_from_u64(start.to_bits()),
+            basic_block_compiles: 0,
         })
     }
 
+    fn compile_basic_block_from(start_pc: PC, grid: &Grid) -> Result<BasicBlock, Error> {
+        let mut basic_block = BasicBlock::new(start_pc);
+
+        let mut current_pc = start_pc;
+        let mut string_mode = false;
+        let mut pcs: HashSet<_, FastHasher> = Default::default();
+        loop {
+            let current_command =
+                grid[current_pc.position.y as usize][current_pc.position.x as usize];
+            if string_mode {
+                if current_command == b'"' {
+                    string_mode = false;
+                } else {
+                    basic_block
+                        .bytecode
+                        .push(Operation::PushConstant(current_command as _));
+                }
+                pcs.insert(current_pc);
+                current_pc.step();
+                current_pc.constrain();
+            } else {
+                // Check if we reached any of our previous PCs to detect loops.
+                if pcs.contains(&current_pc) {
+                    basic_block.cf_decision = ControlFlowDecision::Jump(current_pc);
+                    break;
+                }
+                pcs.insert(current_pc);
+                // FIXME: Check if we reached any start PCs of any other basic block.
+                match current_command {
+                    // PC redirection
+                    b'>' => {
+                        current_pc.direction = Direction::Right;
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'<' => {
+                        current_pc.direction = Direction::Left;
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'^' => {
+                        current_pc.direction = Direction::Up;
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'v' => {
+                        current_pc.direction = Direction::Down;
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'?' => {
+                        let decision = ControlFlowDecision::Random {
+                            choices: [
+                                Direction::Up,
+                                Direction::Down,
+                                Direction::Left,
+                                Direction::Right,
+                            ]
+                            .map(|direction| PC {
+                                position: current_pc.position + direction,
+                                direction,
+                            }),
+                        };
+                        basic_block.cf_decision = decision;
+                        break;
+                    }
+                    b'#' => {
+                        current_pc.step();
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b' ' => {
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    // Literals
+                    b'"' => {
+                        string_mode = true;
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'0'..=b'9' => {
+                        let number = current_command - b'0';
+                        basic_block
+                            .bytecode
+                            .push(Operation::PushConstant(number as _));
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    // Stack ops
+                    b':' => {
+                        basic_block.bytecode.push(Operation::Duplicate);
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'\\' => {
+                        basic_block.bytecode.push(Operation::Swap);
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'$' => {
+                        basic_block.bytecode.push(Operation::Drop);
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    // Math ops
+                    b'+' => {
+                        basic_block
+                            .bytecode
+                            .push(Operation::Binary(BinaryOperation::Add));
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'-' => {
+                        basic_block
+                            .bytecode
+                            .push(Operation::Binary(BinaryOperation::Subtract));
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'*' => {
+                        basic_block
+                            .bytecode
+                            .push(Operation::Binary(BinaryOperation::Multiply));
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'/' => {
+                        basic_block
+                            .bytecode
+                            .push(Operation::Binary(BinaryOperation::Divide));
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'%' => {
+                        basic_block
+                            .bytecode
+                            .push(Operation::Binary(BinaryOperation::Remainder));
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'!' => {
+                        basic_block.bytecode.push(Operation::Negate);
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'`' => {
+                        basic_block
+                            .bytecode
+                            .push(Operation::Binary(BinaryOperation::Greater));
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    // I/O
+                    b',' => {
+                        basic_block.bytecode.push(Operation::Output(IOMode::Ascii));
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'.' => {
+                        basic_block
+                            .bytecode
+                            .push(Operation::Output(IOMode::Decimal));
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'~' => {
+                        basic_block.bytecode.push(Operation::Input(IOMode::Ascii));
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'&' => {
+                        basic_block.bytecode.push(Operation::Input(IOMode::Decimal));
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    // Conditionals
+                    b'_' => {
+                        let decision = ControlFlowDecision::Branch {
+                            true_target: PC {
+                                position: current_pc.position + Direction::Left,
+                                direction: Direction::Left,
+                            },
+                            false_target: PC {
+                                position: current_pc.position + Direction::Right,
+                                direction: Direction::Right,
+                            },
+                        };
+                        basic_block.cf_decision = decision;
+                        break;
+                    }
+                    b'|' => {
+                        let decision = ControlFlowDecision::Branch {
+                            true_target: PC {
+                                position: current_pc.position + Direction::Up,
+                                direction: Direction::Up,
+                            },
+                            false_target: PC {
+                                position: current_pc.position + Direction::Down,
+                                direction: Direction::Down,
+                            },
+                        };
+                        basic_block.cf_decision = decision;
+                        break;
+                    }
+                    b'@' => {
+                        basic_block.cf_decision = ControlFlowDecision::EndProgram;
+                        break;
+                    }
+                    // Self-modification
+                    b'g' => {
+                        basic_block.bytecode.push(Operation::GetValue);
+                        current_pc.step();
+                        current_pc.constrain();
+                    }
+                    b'p' => {
+                        current_pc.step();
+                        current_pc.constrain();
+                        basic_block.bytecode.push(Operation::SetValue {
+                            pc_after: current_pc,
+                        });
+                    }
+                    _ => return Err(Error::IllegalCommand(current_command)),
+                }
+            }
+        }
+        basic_block.cells = pcs.into_iter().map(|pc| pc.position).collect();
+
+        // TODO: Output compiled basic block if CLI flag is on
+
+        Ok(basic_block)
+    }
+
     fn ensure_basic_block(&mut self) -> Result<Rc<BasicBlock>, Error> {
-        todo!("compile")
+        let basic_block_entry = self.basic_blocks.entry(self.program_counter);
+        match basic_block_entry {
+            std::collections::hash_map::Entry::Occupied(basic_block) => {
+                Ok(basic_block.get().clone())
+            }
+            std::collections::hash_map::Entry::Vacant(_) => {
+                let basic_block = Rc::new(Self::compile_basic_block_from(
+                    self.program_counter,
+                    &self.program_grid,
+                )?);
+                self.basic_block_compiles += 1;
+                basic_block_entry.or_insert(basic_block.clone());
+                Ok(basic_block)
+            }
+        }
+    }
+
+    fn invalidate_bytecode(&mut self, cell: Position) {
+        self.basic_blocks
+            .retain(|_, basic_block| !basic_block.cells.contains(&cell));
     }
 }
 
@@ -179,9 +546,27 @@ impl<'rw> Executer for JustInTimeCompiler<'rw> {
             let basic_block = self.ensure_basic_block()?;
             let result = basic_block.execute(self);
             match result {
-                Ok(cf_decision) => {
-                    todo!("execute the control flow");
-                }
+                Ok(cf_decision) => match cf_decision {
+                    ControlFlowDecision::Jump(target) => {
+                        self.program_counter = target;
+                    }
+                    ControlFlowDecision::Branch {
+                        true_target,
+                        false_target,
+                    } => {
+                        let result = self.stack.pop().unwrap_or_default();
+                        self.program_counter = if result == 0 {
+                            false_target
+                        } else {
+                            true_target
+                        };
+                    }
+                    ControlFlowDecision::EndProgram => return Ok(()),
+                    ControlFlowDecision::Random { choices } => {
+                        let choice = *choices.choose(&mut self.rng).unwrap();
+                        self.program_counter = choice;
+                    }
+                },
                 Err(Error::ProgramEnd) => return Ok(()),
                 Err(why) => return Err(why),
             }
@@ -189,7 +574,7 @@ impl<'rw> Executer for JustInTimeCompiler<'rw> {
     }
 
     fn steps(&self) -> usize {
-        1
+        self.basic_block_compiles
     }
 
     fn position(&self) -> Position {

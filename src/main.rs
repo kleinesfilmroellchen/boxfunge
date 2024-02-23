@@ -3,7 +3,10 @@
 use argh::FromArgValue;
 use argh::FromArgs;
 use jit::JustInTimeCompiler;
-use random::Source;
+use rand::distributions::Distribution;
+use rand::distributions::Standard;
+use rand::Rng;
+use rand::SeedableRng;
 use std::fs::File;
 use std::hint::unreachable_unchecked;
 use std::io;
@@ -19,6 +22,10 @@ mod jit;
 
 #[cfg(test)]
 mod test;
+
+// switch between hashing implementations
+// type FastHasher = std::hash::BuildHasherDefault<twox_hash::XxHash64>;
+type FastHasher = metrohash::MetroBuildHasher;
 
 /// "each cell of the stack can hold as much as a C language signed long int on the same platform."
 type Int = std::ffi::c_long;
@@ -101,18 +108,13 @@ impl PC {
     }
 }
 
-impl random::Value for Direction {
-    fn read<S>(source: &mut S) -> Self
-    where
-        S: Source,
-    {
-        let random = source.read_u64();
-        match random % 4 {
-            0 => Self::Up,
-            1 => Self::Down,
-            2 => Self::Left,
-            3 => Self::Right,
-            // SAFETY: i hope math isn't broken
+impl Distribution<Direction> for Standard {
+    fn sample<R: rand::prelude::Rng + ?Sized>(&self, rng: &mut R) -> Direction {
+        match rng.gen_range(0..4) {
+            0 => Direction::Up,
+            1 => Direction::Down,
+            2 => Direction::Left,
+            3 => Direction::Right,
             _ => unsafe { unreachable_unchecked() },
         }
     }
@@ -157,7 +159,7 @@ struct Interpreter<'rw> {
     // I/O
     input: Box<dyn Read + 'rw>,
     output: Box<dyn Write + 'rw>,
-    rng: random::Default,
+    rng: rand::rngs::SmallRng,
     // Debugging
     steps: usize,
 }
@@ -246,7 +248,7 @@ impl<'rw> Interpreter<'rw> {
             program_counter: PC::default(),
             input,
             output,
-            rng: random::Default::new([start.to_bits(), start.to_bits()]),
+            rng: rand::rngs::SmallRng::seed_from_u64(start.to_bits()),
             steps: 0,
         })
     }
@@ -328,7 +330,7 @@ impl<'rw> Interpreter<'rw> {
                     Ok(())
                 }
                 b'?' => {
-                    self.program_counter.direction = self.rng.read();
+                    self.program_counter.direction = self.rng.gen();
                     move_pc!();
                     Ok(())
                 }
@@ -516,7 +518,7 @@ impl<'rw> Interpreter<'rw> {
                     let x = self.stack.pop().unwrap_or_default();
                     let value = self.stack.pop().unwrap_or_default();
                     if (0..GRID_WIDTH as Int).contains(&x) && (0..GRID_HEIGHT as Int).contains(&y) {
-                        self.program_grid[y as usize % GRID_HEIGHT][x as usize % GRID_WIDTH] =
+                        self.program_grid[y as usize][x as usize] =
                             value as u8;
                     }
                     move_pc!();
