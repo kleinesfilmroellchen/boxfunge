@@ -27,6 +27,7 @@ use std::rc::Rc;
 
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
+use smallvec::SmallVec;
 
 use crate::scan_next;
 use crate::Direction;
@@ -242,7 +243,7 @@ impl BasicBlock {
 }
 
 /// A map from grid cells to all entry points of basic blocks that pass through the cell.
-type GridBlockMap = [[Vec<PC>; GRID_WIDTH]; GRID_HEIGHT];
+type GridBlockMap = [[SmallVec<[PC; 4]>; GRID_WIDTH]; GRID_HEIGHT];
 
 pub struct JustInTimeCompiler<'rw> {
     basic_blocks: HashMap<PC, Rc<BasicBlock>, FastHasher>,
@@ -279,7 +280,7 @@ impl<'rw> JustInTimeCompiler<'rw> {
             basic_blocks: Default::default(),
             stack: Vec::new(),
             program_grid: parsed_grid,
-            grid_block_map: array::from_fn(|_| array::from_fn(|_| Vec::new())),
+            grid_block_map: array::from_fn(|_| array::from_fn(|_| SmallVec::new())),
             program_counter: PC::default(),
             input,
             output,
@@ -291,16 +292,22 @@ impl<'rw> JustInTimeCompiler<'rw> {
     fn compile_basic_block_from(
         start_pc: PC,
         grid: &Grid,
-    ) -> Result<(BasicBlock, Vec<Position>), Error> {
+        grid_block_map: &mut GridBlockMap,
+    ) -> Result<BasicBlock, Error> {
         let mut basic_block = BasicBlock::new(start_pc);
 
         let mut current_pc = start_pc;
         let mut string_mode = false;
-        let mut pcs = Vec::new();
         loop {
             let current_command =
                 grid[current_pc.position.y as usize][current_pc.position.x as usize];
-            pcs.push(current_pc.position);
+
+            let grid_block_entry =
+                &mut grid_block_map[current_pc.position.y as usize][current_pc.position.x as usize];
+            if !grid_block_entry.contains(&start_pc) {
+                grid_block_entry.push(start_pc)
+            }
+
             if string_mode {
                 if current_command == b'"' {
                     string_mode = false;
@@ -520,7 +527,7 @@ impl<'rw> JustInTimeCompiler<'rw> {
         }
         // TODO: Output compiled basic block if CLI flag is on
 
-        Ok((basic_block, pcs))
+        Ok(basic_block)
     }
 
     fn ensure_basic_block(&mut self) -> Result<Rc<BasicBlock>, Error> {
@@ -530,16 +537,14 @@ impl<'rw> JustInTimeCompiler<'rw> {
                 Ok(basic_block.get().clone())
             }
             std::collections::hash_map::Entry::Vacant(_) => {
-                let (basic_block, elements) =
-                    Self::compile_basic_block_from(self.program_counter, &self.program_grid)?;
+                let basic_block = Self::compile_basic_block_from(
+                    self.program_counter,
+                    &self.program_grid,
+                    &mut self.grid_block_map,
+                )?;
                 let basic_block = Rc::new(basic_block);
                 self.basic_block_compiles += 1;
                 basic_block_entry.or_insert(basic_block.clone());
-
-                for cell in elements {
-                    self.grid_block_map[cell.y as usize][cell.x as usize]
-                        .push(self.program_counter);
-                }
 
                 Ok(basic_block)
             }
