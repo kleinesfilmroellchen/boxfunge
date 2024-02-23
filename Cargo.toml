@@ -11,5 +11,9 @@ rand = { version = "0.8.5", default-features = false, features = [
 	"std",
 	"small_rng",
 ] }
+smallvec = "1.13.1"
 thiserror = "1.0.57"
 twox-hash = "1.6.3"
+
+[profile.release]
+debug = true

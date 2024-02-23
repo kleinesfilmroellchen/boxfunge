@@ -18,8 +18,8 @@
 //!
 //! When a self-modification occurs, all basic blocks on the path of the self-modification are discarded. Execution continues from the next cell as given in the SetValue byte code op if the basic block invalidated itself. The latter is less efficient than it could be, since we could continue executing the basic block if the modification happened only for byte code ops that have already been executed. However, this would require keeping track of source cells for each byte code op, which seems like a significant complication in terms of memory management (one byte code op may refer to many source cells after optimization). It is not clear if this actually provides a practical benefit, since a lot of code is not immediately self-modifying, rather modifying some other (often distant) basic block.
 
+use std::array;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::io;
 use std::io::Read;
 use std::io::Write;
@@ -40,6 +40,8 @@ use crate::Position;
 use crate::GRID_HEIGHT;
 use crate::GRID_WIDTH;
 use crate::PC;
+
+const BASIC_BLOCK_SIZE_LIMIT: usize = 2048;
 
 /// JIT byte code operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,7 +122,6 @@ enum ControlFlowDecision {
 #[derive(Clone, Debug)]
 struct BasicBlock {
     entry_point: PC,
-    cells: HashSet<Position, FastHasher>,
     bytecode: Vec<Operation>,
     cf_decision: ControlFlowDecision,
 }
@@ -135,7 +136,6 @@ impl BasicBlock {
     fn new(entry_point: PC) -> Self {
         Self {
             entry_point,
-            cells: Default::default(),
             bytecode: Vec::new(),
             cf_decision: ControlFlowDecision::EndProgram,
         }
@@ -229,9 +229,9 @@ impl BasicBlock {
                     if (0..GRID_WIDTH as Int).contains(&x) && (0..GRID_HEIGHT as Int).contains(&y) {
                         jit.program_grid[y as usize][x as usize] = value as u8;
                     }
-                    jit.invalidate_bytecode(position);
+                    let invalidated_entries = jit.invalidate_bytecode(position);
                     // If we were invalidated, exit bytecode immediately and continue with the next PC.
-                    if self.cells.contains(&position) {
+                    if invalidated_entries.contains(&self.entry_point.position) {
                         return Ok(ControlFlowDecision::Jump(*pc_after));
                     }
                 }
@@ -241,9 +241,13 @@ impl BasicBlock {
     }
 }
 
+/// A map from grid cells to all entry points of basic blocks that pass through the cell.
+type GridBlockMap = [[Vec<PC>; GRID_WIDTH]; GRID_HEIGHT];
+
 pub struct JustInTimeCompiler<'rw> {
     basic_blocks: HashMap<PC, Rc<BasicBlock>, FastHasher>,
     program_grid: Grid,
+    grid_block_map: GridBlockMap,
     stack: Vec<Int>,
     program_counter: PC,
     // I/O
@@ -275,6 +279,7 @@ impl<'rw> JustInTimeCompiler<'rw> {
             basic_blocks: Default::default(),
             stack: Vec::new(),
             program_grid: parsed_grid,
+            grid_block_map: array::from_fn(|_| array::from_fn(|_| Vec::new())),
             program_counter: PC::default(),
             input,
             output,
@@ -283,15 +288,19 @@ impl<'rw> JustInTimeCompiler<'rw> {
         })
     }
 
-    fn compile_basic_block_from(start_pc: PC, grid: &Grid) -> Result<BasicBlock, Error> {
+    fn compile_basic_block_from(
+        start_pc: PC,
+        grid: &Grid,
+    ) -> Result<(BasicBlock, Vec<Position>), Error> {
         let mut basic_block = BasicBlock::new(start_pc);
 
         let mut current_pc = start_pc;
         let mut string_mode = false;
-        let mut pcs: HashSet<_, FastHasher> = Default::default();
+        let mut pcs = Vec::new();
         loop {
             let current_command =
                 grid[current_pc.position.y as usize][current_pc.position.x as usize];
+            pcs.push(current_pc.position);
             if string_mode {
                 if current_command == b'"' {
                     string_mode = false;
@@ -300,16 +309,16 @@ impl<'rw> JustInTimeCompiler<'rw> {
                         .bytecode
                         .push(Operation::PushConstant(current_command as _));
                 }
-                pcs.insert(current_pc);
                 current_pc.step();
                 current_pc.constrain();
             } else {
-                // Check if we reached any of our previous PCs to detect loops.
-                if pcs.contains(&current_pc) {
+                // Automatically stop a basic block after reaching a certain number of basic blocks.
+                // This is a crude infinite loop detection that performs better than checking all previously visited PCs.
+                // If the loop contains no actual commands (except unconditional PC redirects), we still get stuck, but since the program doesn't do anything in that case, the behavior is correct.
+                if basic_block.bytecode.len() > BASIC_BLOCK_SIZE_LIMIT {
                     basic_block.cf_decision = ControlFlowDecision::Jump(current_pc);
                     break;
                 }
-                pcs.insert(current_pc);
                 // FIXME: Check if we reached any start PCs of any other basic block.
                 match current_command {
                     // PC redirection
@@ -509,11 +518,9 @@ impl<'rw> JustInTimeCompiler<'rw> {
                 }
             }
         }
-        basic_block.cells = pcs.into_iter().map(|pc| pc.position).collect();
-
         // TODO: Output compiled basic block if CLI flag is on
 
-        Ok(basic_block)
+        Ok((basic_block, pcs))
     }
 
     fn ensure_basic_block(&mut self) -> Result<Rc<BasicBlock>, Error> {
@@ -523,20 +530,33 @@ impl<'rw> JustInTimeCompiler<'rw> {
                 Ok(basic_block.get().clone())
             }
             std::collections::hash_map::Entry::Vacant(_) => {
-                let basic_block = Rc::new(Self::compile_basic_block_from(
-                    self.program_counter,
-                    &self.program_grid,
-                )?);
+                let (basic_block, elements) =
+                    Self::compile_basic_block_from(self.program_counter, &self.program_grid)?;
+                let basic_block = Rc::new(basic_block);
                 self.basic_block_compiles += 1;
                 basic_block_entry.or_insert(basic_block.clone());
+
+                for cell in elements {
+                    self.grid_block_map[cell.y as usize][cell.x as usize]
+                        .push(self.program_counter);
+                }
+
                 Ok(basic_block)
             }
         }
     }
 
-    fn invalidate_bytecode(&mut self, cell: Position) {
-        self.basic_blocks
-            .retain(|_, basic_block| !basic_block.cells.contains(&cell));
+    /// Returns the entry point positions of invalidated basic blocks.
+    fn invalidate_bytecode(&mut self, cell: Position) -> Vec<Position> {
+        let invalid_entry_points = &mut self.grid_block_map[cell.y as usize][cell.x as usize];
+        for invalid_entry_point in invalid_entry_points.iter() {
+            self.basic_blocks.remove(invalid_entry_point);
+        }
+
+        invalid_entry_points
+            .drain(..)
+            .map(|pc| pc.position)
+            .collect()
     }
 }
 
