@@ -100,7 +100,6 @@ fn cli() {
         show_performance: false,
         language_standard: crate::LanguageStandard::Befunge93,
         stdin: None,
-        use_jit: false,
     })
     .unwrap();
 
@@ -109,7 +108,6 @@ fn cli() {
         show_performance: true,
         language_standard: crate::LanguageStandard::Befunge93,
         stdin: Some("programs/kquine3.bf".into()),
-        use_jit: false,
     })
     .unwrap();
 }
