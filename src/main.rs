@@ -2,7 +2,6 @@
 
 use argh::FromArgValue;
 use argh::FromArgs;
-use jit::JustInTimeCompiler;
 use rand::distributions::Distribution;
 use rand::distributions::Standard;
 use rand::Rng;
@@ -18,14 +17,8 @@ use std::path::PathBuf;
 use std::slice;
 use std::str::FromStr;
 
-mod jit;
-
 #[cfg(test)]
 mod test;
-
-// switch between hashing implementations
-// type FastHasher = std::hash::BuildHasherDefault<twox_hash::XxHash64>;
-type FastHasher = metrohash::MetroBuildHasher;
 
 /// "each cell of the stack can hold as much as a C language signed long int on the same platform."
 type Int = std::ffi::c_long;
@@ -34,6 +27,7 @@ const GRID_HEIGHT: usize = 25;
 const GRID_WIDTH: usize = 80;
 type Line = [u8; GRID_WIDTH];
 type Grid = [Line; GRID_HEIGHT];
+type Stack = Vec<Int>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum LanguageStandard {
@@ -65,9 +59,6 @@ struct Arguments {
     /// collect and show performance metrics
     #[argh(switch, short = 'p')]
     show_performance: bool,
-    /// use the experimental just-in-time compiler
-    #[argh(switch, short = 'j')]
-    use_jit: bool,
     /// language standard to use, for future compatibility. default: 98
     #[argh(option, short = 's', default = "LanguageStandard::default()")]
     language_standard: LanguageStandard,
@@ -153,7 +144,7 @@ struct Interpreter<'rw> {
     // Data and program
     program_grid: Grid,
     // Core state
-    stack: Vec<Int>,
+    stack: Stack,
     string_mode: bool,
     program_counter: PC,
     // I/O
@@ -172,8 +163,8 @@ enum Error {
     InvalidGridSize(usize, usize),
     #[error("Non-ASCII character \"{0:x}\" in input")]
     NonAscii(Int),
-    #[error("Illegal command '{}' ({0:x})", *.0 as char)]
-    IllegalCommand(u8),
+    #[error("Illegal command '{}' ({command:x})", *.command as char)]
+    IllegalCommand { command: u8 },
     #[error("Program terminated normally")]
     ProgramEnd,
 }
@@ -242,7 +233,7 @@ impl<'rw> Interpreter<'rw> {
             .as_secs_f64();
         let parsed_grid = Self::parse_grid(grid)?;
         Ok(Self {
-            stack: Vec::new(),
+            stack: Stack::new(),
             program_grid: parsed_grid,
             string_mode: false,
             program_counter: PC::default(),
@@ -364,8 +355,6 @@ impl<'rw> Interpreter<'rw> {
                     Ok(())
                 }
                 b'\\' => {
-                    // TODO:
-                    // let last_chunk = self.stack.last_chunk_mut::<2>();
                     let top = self.stack.pop().unwrap_or_default();
                     let second = self.stack.pop().unwrap_or_default();
                     self.stack.push(top);
@@ -518,15 +507,16 @@ impl<'rw> Interpreter<'rw> {
                     let x = self.stack.pop().unwrap_or_default();
                     let value = self.stack.pop().unwrap_or_default();
                     if (0..GRID_WIDTH as Int).contains(&x) && (0..GRID_HEIGHT as Int).contains(&y) {
-                        self.program_grid[y as usize][x as usize] =
-                            value as u8;
+                        self.program_grid[y as usize][x as usize] = value as u8;
                     }
                     move_pc!();
                     Ok(())
                 }
                 // Misc
                 b'@' => Err(Error::ProgramEnd),
-                _ => Err(Error::IllegalCommand(current_char)),
+                _ => Err(Error::IllegalCommand {
+                    command: current_char,
+                }),
             }
         }
     }
@@ -559,29 +549,12 @@ fn run_interpreter(args: Arguments) -> Result<(), Error> {
     } else {
         File::open(args.input)?.read_to_string(&mut grid)?;
     }
-    let mut interpreter: Box<dyn Executer> = if args.use_jit {
-        Box::new(args.stdin.map_or_else(
-            || JustInTimeCompiler::new(&grid),
-            |stdin| {
-                JustInTimeCompiler::new_with_io(
-                    &grid,
-                    Box::new(File::open(stdin)?),
-                    Box::new(io::stdout()),
-                )
-            },
-        )?)
-    } else {
-        Box::new(args.stdin.map_or_else(
-            || Interpreter::new(&grid),
-            |stdin| {
-                Interpreter::new_with_io(
-                    &grid,
-                    Box::new(File::open(stdin)?),
-                    Box::new(io::stdout()),
-                )
-            },
-        )?)
-    };
+    let mut interpreter = Box::new(args.stdin.map_or_else(
+        || Interpreter::new(&grid),
+        |stdin| {
+            Interpreter::new_with_io(&grid, Box::new(File::open(stdin)?), Box::new(io::stdout()))
+        },
+    )?);
 
     let start = std::time::Instant::now();
     let result = interpreter.run_forever();

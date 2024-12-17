@@ -1,19 +1,16 @@
 [package]
 name = "boxfunge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-argh = "0.1.12"
-glam = "0.25.0"
-metrohash = "1.0.6"
-rand = { version = "0.8.5", default-features = false, features = [
+argh = "0.1"
+glam = "0.29"
+rand = { version = "0.8", default-features = false, features = [
 	"std",
 	"small_rng",
 ] }
-smallvec = "1.13.1"
-thiserror = "1.0.57"
-twox-hash = "1.6.3"
+thiserror = "2"
 
 [profile.release]
-debug = true
+lto = "fat"
