@@ -2,6 +2,7 @@
 name = "boxfunge"
 version = "0.2.0"
 edition = "2021"
+default-run = "boxfunge"
 
 [dependencies]
 argh = "0.1"
@@ -10,6 +11,7 @@ rand = { version = "0.8", default-features = false, features = [
 	"std",
 	"small_rng",
 ] }
+tempfile = "3.14.0"
 thiserror = "2"
 
 [profile.release]

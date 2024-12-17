@@ -4,7 +4,7 @@
 
 Boxfunge (oxidized Befunge) is an experimental interpreter for the esoteric [Befunge](https://catseye.tc/view/Befunge-93/doc/Befunge-93.markdown) programming language. Befunge is one of the most well-known esoteric programming languages and intended to be hard to compile.
 
-This implementation has a basic, but very fast interpreter as its core. Currently, a very complicated program, such as the self-interpreter included in this repo, can run at roughly 4ns per Befunge command (200 million steps per second) in release mode. In fact, the interpreter is so fast that an optimizing JIT compiler was removed as it ran about 20% slower than the interpreter on average. The entire interpreter executable (no shared library dependencies) is only a few hundred kilobytes large.
+This implementation has a basic, but very fast interpreter as its core. Currently, a very complicated program, such as the self-interpreter included in this repo, can run at roughly 4ns per Befunge command (200 million steps per second) in release mode. In fact, the interpreter is so fast that an optimizing JIT compiler was removed as it ran about 20% slower than the interpreter on average. The entire interpreter executable (no shared library dependencies) is only a few hundred kilobytes large. Using the `-o` option, a Befunge program can be compiled into a standalone executable, which is even smaller in size (and probably a bit faster) than the interpreter.
 
 Boxfunge supports standard Befunge-93, the original variant. However, it is planned to remove the 80x25 grid restriction via a command-line flag, which would allow the language to be Turing-complete. Support for Befunge-98 (a generalized extension with many advanced features like concurrency) may be added at some point.
 

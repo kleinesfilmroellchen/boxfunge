@@ -6,6 +6,7 @@ use rand::distributions::Distribution;
 use rand::distributions::Standard;
 use rand::Rng;
 use rand::SeedableRng;
+use std::ffi::OsString;
 use std::fs::File;
 use std::hint::unreachable_unchecked;
 use std::io;
@@ -14,6 +15,7 @@ use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::slice;
 use std::str::FromStr;
 
@@ -23,14 +25,14 @@ mod test;
 /// "each cell of the stack can hold as much as a C language signed long int on the same platform."
 type Int = std::ffi::c_long;
 
-const GRID_HEIGHT: usize = 25;
-const GRID_WIDTH: usize = 80;
-type Line = [u8; GRID_WIDTH];
-type Grid = [Line; GRID_HEIGHT];
+pub const GRID_HEIGHT: usize = 25;
+pub const GRID_WIDTH: usize = 80;
+pub type Line = [u8; GRID_WIDTH];
+pub type Grid = [Line; GRID_HEIGHT];
 type Stack = Vec<Int>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum LanguageStandard {
+pub enum LanguageStandard {
     Befunge93,
     #[default]
     Befunge98,
@@ -52,19 +54,22 @@ impl FromArgValue for LanguageStandard {
 
 #[derive(FromArgs)]
 /// Befunge-93 interpreter.
-struct Arguments {
+pub struct Arguments {
     /// input file to read
     #[argh(positional)]
-    input: PathBuf,
+    pub input: PathBuf,
     /// collect and show performance metrics
     #[argh(switch, short = 'p')]
-    show_performance: bool,
+    pub show_performance: bool,
     /// language standard to use, for future compatibility. default: 98
     #[argh(option, short = 's', default = "LanguageStandard::default()")]
-    language_standard: LanguageStandard,
+    pub language_standard: LanguageStandard,
     /// file to use as stdin for the program; particularly useful with self-interpreters
     #[argh(option, short = 'i')]
-    stdin: Option<PathBuf>,
+    pub stdin: Option<PathBuf>,
+    /// output program name. If this is given, boxfunge produces an executable from the given source file instead of running it.
+    #[argh(option, short = 'o')]
+    pub output: Option<PathBuf>,
 }
 
 type Position = glam::I64Vec2;
@@ -131,7 +136,7 @@ impl std::ops::AddAssign<Direction> for Position {
 }
 
 /// Anything executing a Befunge program.
-trait Executer {
+pub trait Executer {
     /// Run the executer's main loop.
     fn run_forever(&mut self) -> Result<(), Error>;
     fn steps(&self) -> usize;
@@ -140,7 +145,7 @@ trait Executer {
 
 /// The Befunge interpreter.
 /// Lifetime parameter is for the I/O structures, which must outlive the interpreter.
-struct Interpreter<'rw> {
+pub struct Interpreter<'rw> {
     // Data and program
     program_grid: Grid,
     // Core state
@@ -156,7 +161,7 @@ struct Interpreter<'rw> {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum Error {
+pub enum Error {
     #[error("Input/Output error")]
     Io(#[from] io::Error),
     #[error("Grid size {0} x {1} invalid")]
@@ -227,21 +232,29 @@ impl<'rw> Interpreter<'rw> {
         input: Box<dyn Read + 'rw>,
         output: Box<dyn Write + 'rw>,
     ) -> Result<Self, Error> {
+        let parsed_grid = Self::parse_grid(grid)?;
+        Ok(Self::new_with_io_and_grid(parsed_grid, input, output))
+    }
+
+    pub fn new_with_io_and_grid(
+        grid: Grid,
+        input: Box<dyn Read + 'rw>,
+        output: Box<dyn Write + 'rw>,
+    ) -> Self {
         let start = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs_f64();
-        let parsed_grid = Self::parse_grid(grid)?;
-        Ok(Self {
+        Self {
             stack: Stack::new(),
-            program_grid: parsed_grid,
+            program_grid: grid,
             string_mode: false,
             program_counter: PC::default(),
             input,
             output,
             rng: rand::rngs::SmallRng::seed_from_u64(start.to_bits()),
             steps: 0,
-        })
+        }
     }
 
     pub fn parse_grid(grid: &str) -> Result<Grid, Error> {
@@ -542,13 +555,56 @@ impl<'rw> Executer for Interpreter<'rw> {
     }
 }
 
-fn run_interpreter(args: Arguments) -> Result<(), Error> {
+fn compile_embedded_befunge(grid: String, output: PathBuf) -> Result<(), Error> {
+    #[cfg(not(windows))]
+    const EXECUTABLE_NAME: &str = "embedded_befunge";
+    #[cfg(windows)]
+    const EXECUTABLE_NAME: &str = "embedded_befunge.exe";
+
+    let grid = Interpreter::parse_grid(&grid)?;
+    let stringified_grid = format!("{:?}", grid);
+
+    let mut gridfile = tempfile::NamedTempFile::new()?;
+    gridfile.write_all(stringified_grid.as_bytes())?;
+    let target_dir = tempfile::tempdir()?;
+
+    // This is a big fucking hack and only works when you have the repo locally and call the program from the right directory.
+    Command::new("cargo")
+        .args(["build", "-q", "--release", "--bin", "embedded_befunge"])
+        .args([
+            &OsString::try_from(&"--target-dir")
+                .expect("--target-dir is not a valid OS string. Your system sure is fucked."),
+            target_dir.path().as_os_str(),
+        ])
+        .env("BEFUNGE_CODE_SRC", gridfile.path())
+        .status()?;
+
+    let mut executable = target_dir.path().to_owned();
+    executable.push("release");
+    executable.push(EXECUTABLE_NAME);
+    std::fs::rename(executable, &output)?;
+
+    println!(
+        "Written embedded befunge executable to {}",
+        output.to_string_lossy()
+    );
+
+    Ok(())
+}
+
+pub fn run_interpreter(args: Arguments) -> Result<(), Error> {
     let mut grid: String = String::new();
     if args.input == Path::new("-") {
         io::stdin().read_to_string(&mut grid)?;
     } else {
         File::open(args.input)?.read_to_string(&mut grid)?;
     }
+
+    if let Some(output) = args.output {
+        compile_embedded_befunge(grid, output)?;
+        return Ok(());
+    }
+
     let mut interpreter = Box::new(args.stdin.map_or_else(
         || Interpreter::new(&grid),
         |stdin| {
@@ -583,15 +639,4 @@ fn run_interpreter(args: Arguments) -> Result<(), Error> {
     }
 
     Ok(())
-}
-
-fn main() {
-    let args: Arguments = argh::from_env();
-
-    if args.language_standard != LanguageStandard::Befunge93 {
-        eprintln!("only Befunge-93 is currently supported");
-        std::process::exit(1);
-    }
-
-    run_interpreter(args).unwrap();
 }
